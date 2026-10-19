@@ -20,7 +20,7 @@ Java 侧只通过两个类使用原生库：
 - `nobleworks.libmpg.MP3Decoder` → `System.loadLibrary("mpg")`
 - `org.vinuxproject.sonic.Sonic` → `System.loadLibrary("sonic")`
 
-播放链路：`PlayerService` 创建 `Playerv3`；`Playerv3.DecodingThread` 用 `MP3Decoder` 解码 16-bit PCM 到直接 `ShortBuffer`，`Playerv3.PlayerThread` 用 `Sonic` 做变速（`putBytes`/`receiveBytes`），最后写 `AudioTrack`。
+播放链路：`PlayerService` 创建 `Playerv3`；`Playerv3.DecodingThread` 用 `MP3Decoder` 解码 16-bit PCM 到直接 `ByteBuffer`（32768 字节）/ `ShortBuffer`，`Playerv3.PlayerThread` 用 `Sonic` 做变速（`putBytes`/`receiveBytes`），最后写 `AudioTrack`。`Playerv2` 在 v75 里是死代码（`PlayerService` 只实例化 `Playerv3`），且其代码有 `ByteBuffer.allocateDirect(4096).array()` 的潜在崩溃，不作为行为参考。
 
 音乐列表来自系统 MediaStore（`ContentResolver.query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, ...)`），也就是通过 `DATA` 列拿到文件路径后再交给 `MP3Decoder(String path)`。代码里没有 `Environment.getExternalStorageDirectory()`，也没有任何 `Build.CPU_ABI` / `os.arch` 判断——**只要 64 位库放进 `lib/arm64-v8a/`，Java 侧无需任何改动**。
 
@@ -63,6 +63,8 @@ Java_nobleworks_libmpg_MP3Decoder_getLength(J)F
 ```
 
 注意：dex 里还存在 `getFlags()`, `setFlags()`, `getSupportedEncodings()`, `getSupportedRates()`, `seekTo(I)` 等 Java 包装，其中 `getFlags/setFlags` 的 native 实现在原库中**并不存在**（Java 侧从未调用，属库内遗留 API）。为保持行为一致，重建版也不导出这两个符号。
+
+另一个核对结果：原 `libmpg.so` / `libsonic.so` **都没有 `JNI_OnLoad`，也没有 `RegisterNatives`**（两个 ABI 均确认），JNI 方法完全靠符号名查找。因此重建的库只要保证导出符号名一致即可，无需任何注册逻辑。
 
 ### 3.2 Decoder 结构体（32 字节，来自 disasm 字段偏移）
 
@@ -141,6 +143,7 @@ Java `Encoding` 枚举声明顺序（即 `Enum.ordinal()`）：
 
 - 只在 zip 内新增 `lib/arm64-v8a/{libmpg.so,libsonic.so}`；其余条目逐字节复制（保留原压缩方式、时间戳、属性）。
 - 删除旧签名文件（`META-INF/MANIFEST.MF`、`ANDROID.SF`、`ANDROID.RSA`），由 `apksigner` 重新生成 v1 + v2 + v3 签名。
+  原始 APK 实际是 v1 + v2 签名（AOSP testkey，`CN=Android`），重签后升级为 v1 + v2 + v3。
 - `zipalign -p 4` 保证 4 字节对齐（`.so` 在 APK 内为压缩存储，安装时解压，故不依赖 APK 内的页对齐；ELF 自身按 16 KB `p_align` 构建以适配 16 KB 页内核）。
 - 公开密钥：`tools/mafon_re.jks`（alias `mafon`，storepass/keypass `mafon_re`）。使用公开密钥是为了让任何人能重现完全相同的签名配置并发布可覆盖升级的版本；它不保护任何机密。
 

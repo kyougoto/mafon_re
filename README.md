@@ -38,6 +38,8 @@ lib/armeabi-v7a/libmpg.so    lib/armeabi-v7a/libsonic.so
 | [`dist/mafon-1.0-arm64.apk`](dist/mafon-1.0-arm64.apk) | 只新增 arm64 库，**不改任何清单/行为** | Android 13 及以下；任何不再限制 targetSdk 的系统 |
 | [`dist/mafon-1.0-arm64-sdk25.apk`](dist/mafon-1.0-arm64-sdk25.apk) | 同上，另外把 `android:targetSdkVersion` 由 16 提升到 25 | Android 14/15（Android 14 起禁止安装 targetSdk < 23 的应用，Android 15 起 < 24） |
 
+也可以直接从 [GitHub Releases](https://github.com/kyougoto/mafon_re/releases/tag/v1.0-arm64) 下载这两个 APK。
+
 安装：
 
 ```powershell

@@ -9,6 +9,10 @@
 | --- | --- |
 | 原始 APK（`mafon权限修改.apk`，`com.neosphere.mafon` 1.0/75） | `af4c66c95e4b49ce28247050c9b63426a16c9736bafbcc2abbe23d49e1fd9efd` |
 
+原始 APK 的签名：`apksigner verify --print-certs` 显示 v1=true、v2=true、v3=false，证书为
+AOSP testkey（`CN=Android, O=Android, C=US`，SHA-256 `a40da80a59d170caa950cf15c18c454d47a39b26989d8b640ecd745ba71bf5dc`），
+因此重打包后无法用原签名覆盖安装，必须先卸载原版。
+
 ```
 package: com.neosphere.mafon   versionCode 75   versionName 1.0
 minSdkVersion 8   targetSdkVersion 16

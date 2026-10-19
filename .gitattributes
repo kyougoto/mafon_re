@@ -1,0 +1,9 @@
+﻿* -text
+*.apk binary
+*.so binary
+*.a binary
+*.jks binary
+*.png binary
+*.ttf binary
+*.ogg binary
+*.bin binary

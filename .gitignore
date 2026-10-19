@@ -1,0 +1,10 @@
+﻿# build outputs
+build/
+native/build/
+native/buildlogs/
+native/out/
+# python
+__pycache__/
+*.pyc
+# misc
+*.log

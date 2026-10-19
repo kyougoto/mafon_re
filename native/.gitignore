@@ -1,0 +1,7 @@
+# Build outputs (regenerable, not for the repo)
+/build/
+/buildlogs/
+/out/
+# Local editor/OS noise
+*.log
+Thumbs.db

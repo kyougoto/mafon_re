@@ -8,6 +8,22 @@ file was reconstructed from the ARM disassembly; see
 (`Decoder` struct layout, `openFile` format negotiation, `readSamples` buffer
 refill, seek semantics, encoding-ordinal mapping).
 
+## Multiple-format support (`media_decoder.c`)
+
+The original `libmpg.so` is mpg123-only (MP3), while the app lists every audio file from
+MediaStore.  `media_decoder.c/.h` adds a fallback decoder built on NDK
+`AMediaExtractor` + `AMediaCodec` (libmediandk, API 21+):
+
+* `mpg_jni.c` first tries the original mpg123 path (`open_mpg123()`), so MP3 behaviour is unchanged;
+* if that fails it opens the file with `media_decoder_open()`, which demuxes/decodes any audio the
+  platform supports (m4a/AAC, flac, ogg/vorbis, opus, wav, ...) into interleaved 16-bit stereo PCM
+  at the stream's native rate and serves it through the same `readSamples/skipSamples/seek*` API.
+
+`media_test.c` is a small on-device smoke test for the decoder.  Note: on Android 15+ the NDK
+MediaCodec APIs do not produce output in a plain native process without a JavaVM, so `media_test.c`
+is only meaningful on Android 14 and below (or when packaged into an app); inside the Mafon app
+process it works normally.
+
 ## Build wiring
 
 | property | value |

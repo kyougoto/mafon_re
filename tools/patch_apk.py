@@ -44,6 +44,7 @@ ABI = "arm64-v8a"
 
 # android:targetSdkVersion resource id
 ATTR_TARGET_SDK = 0x01010270
+ATTR_VERSION_CODE = 0x0101021b
 CHUNK_XML = 0x0003
 CHUNK_STRING_POOL = 0x0001
 CHUNK_RESOURCE_MAP = 0x0180
@@ -69,12 +70,12 @@ def collect_libs(libs_dir: str):
     return found
 
 
-def patch_axml_target_sdk(data: bytes, new_target: int) -> bytes:
-    """Return AndroidManifest.xml bytes with android:targetSdkVersion replaced.
+def patch_axml_attr(data: bytes, attr_id: int, value: int, label: str) -> bytes:
+    """Return AndroidManifest.xml bytes with one integer attribute replaced.
 
     The manifest is a compiled Android binary XML document.  Only the 32-bit
-    data payload of the targetSdkVersion attribute is rewritten; everything
-    else (including all chunk offsets) stays byte-identical.
+    data payload of the matching attribute is rewritten; everything else
+    (including all chunk offsets) stays byte-identical.
     """
     buf = bytearray(data)
     if len(buf) < 8:
@@ -99,22 +100,22 @@ def patch_axml_target_sdk(data: bytes, new_target: int) -> bytes:
             for i in range(attr_count):
                 off = pos + 16 + attrs_start + i * attr_size
                 _ns, name_idx, _raw = struct.unpack_from("<iii", buf, off)
-                size, _res0, data_type, value = struct.unpack_from("<HBBI", buf, off + 12)
+                size, _res0, data_type, old_value = struct.unpack_from("<HBBI", buf, off + 12)
                 if resource_map is not None and 0 <= name_idx < len(resource_map):
-                    attr_id = resource_map[name_idx]
+                    found_id = resource_map[name_idx]
                 else:
-                    attr_id = None
-                if attr_id == ATTR_TARGET_SDK and data_type in (TYPE_INT_DEC, TYPE_INT_HEX):
-                    struct.pack_into("<I", buf, off + 16, new_target)
+                    found_id = None
+                if found_id == attr_id and data_type in (TYPE_INT_DEC, TYPE_INT_HEX):
+                    struct.pack_into("<I", buf, off + 16, value)
                     patched += 1
         pos += chunk_size
 
     if patched != 1:
-        raise ValueError("expected exactly one targetSdkVersion attribute, patched %d" % patched)
+        raise ValueError("expected exactly one %s attribute, patched %d" % (label, patched))
     return bytes(buf)
 
 
-def patch(src_apk: str, libs_dir: str, out_apk: str, target_sdk=None) -> None:
+def patch(src_apk: str, libs_dir: str, out_apk: str, target_sdk=None, version_code=None) -> None:
     libs = collect_libs(libs_dir)
 
     with zipfile.ZipFile(src_apk, "r") as zin, \
@@ -125,8 +126,13 @@ def patch(src_apk: str, libs_dir: str, out_apk: str, target_sdk=None) -> None:
             if is_signature_entry(item.filename):
                 continue
             data = zin.read(item.filename)
-            if item.filename == "AndroidManifest.xml" and target_sdk is not None:
-                data = patch_axml_target_sdk(data, int(target_sdk))
+            if item.filename == "AndroidManifest.xml":
+                if target_sdk is not None:
+                    data = patch_axml_attr(data, ATTR_TARGET_SDK, int(target_sdk),
+                                           "android:targetSdkVersion")
+                if version_code is not None:
+                    data = patch_axml_attr(data, ATTR_VERSION_CODE, int(version_code),
+                                           "android:versionCode")
             target = zipfile.ZipInfo(item.filename, date_time=item.date_time)
             target.compress_type = item.compress_type
             target.external_attr = item.external_attr
@@ -151,6 +157,8 @@ def patch(src_apk: str, libs_dir: str, out_apk: str, target_sdk=None) -> None:
     print("added ABI: %s -> %s" % (ABI, ", ".join(sorted(libs))))
     if target_sdk is not None:
         print("patched android:targetSdkVersion -> %d" % int(target_sdk))
+    if version_code is not None:
+        print("patched android:versionCode -> %d" % int(version_code))
 
 
 def main() -> int:
@@ -161,10 +169,12 @@ def main() -> int:
     ap.add_argument("--out", required=True, help="output unsigned APK path")
     ap.add_argument("--target-sdk", type=int, default=None,
                     help="optionally rewrite android:targetSdkVersion in the binary manifest")
+    ap.add_argument("--version-code", type=int, default=None,
+                    help="optionally rewrite android:versionCode in the binary manifest")
     args = ap.parse_args()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    patch(args.src, args.libs, args.out, args.target_sdk)
+    patch(args.src, args.libs, args.out, args.target_sdk, args.version_code)
     return 0
 
 

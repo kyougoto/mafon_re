@@ -20,7 +20,7 @@ Java 侧只通过两个类使用原生库：
 - `nobleworks.libmpg.MP3Decoder` → `System.loadLibrary("mpg")`
 - `org.vinuxproject.sonic.Sonic` → `System.loadLibrary("sonic")`
 
-播放链路：`PlayerService` 创建 `Playerv3`；`Playerv3.DecodingThread` 用 `MP3Decoder` 解码 16-bit PCM 到直接 `ByteBuffer`（32768 字节）/ `ShortBuffer`，`Playerv3.PlayerThread` 用 `Sonic` 做变速（`putBytes`/`receiveBytes`），最后写 `AudioTrack`。`Playerv2` 在 v75 里是死代码（`PlayerService` 只实例化 `Playerv3`），且其代码有 `ByteBuffer.allocateDirect(4096).array()` 的潜在崩溃，不作为行为参考。
+播放链路：`PlayerService` 创建 `Playerv3`；`Playerv3.DecodingThread` 用 `MP3Decoder` 解码 16-bit PCM 到直接 `ByteBuffer`（32768 字节）/ `ShortBuffer`，`Playerv3.PlayerThread` 用 `Sonic` 做变速（`putBytes`/`receiveBytes`），最后写 `AudioTrack`。`MP3Decoder` 是唯一入口，因此非 MP3 格式的支持全部做在 `libmpg.so` 内部（见 §6）。`Playerv2` 在 v75 里是死代码（`PlayerService` 只实例化 `Playerv3`），且其代码有 `ByteBuffer.allocateDirect(4096).array()` 的潜在崩溃，不作为行为参考。
 
 音乐列表来自系统 MediaStore（`ContentResolver.query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, ...)`），也就是通过 `DATA` 列拿到文件路径后再交给 `MP3Decoder(String path)`。代码里没有 `Environment.getExternalStorageDirectory()`，也没有任何 `Build.CPU_ABI` / `os.arch` 判断——**只要 64 位库放进 `lib/arm64-v8a/`，Java 侧无需任何改动**。
 
@@ -153,3 +153,41 @@ Java `Encoding` 枚举声明顺序（即 `Enum.ordinal()`）：
 - 因此 `dist/mafon-1.0-arm64-sdk25.apk` 在二进制清单里把 `targetSdkVersion` 从 16 改为 25（`patch_apk.py --target-sdk 25` 只改 `uses-sdk` 属性的 32 位数据，不动任何 chunk 偏移）。
   选择 25 而不是 28/29 的原因：API 26 才开始限制后台 Service，而本应用用 `PlayerService` 做后台播放，targetSdk 25 可以保留原来的后台行为；同时 25 ≥ 24 满足 Android 15 的安装门槛。
 - targetSdk ≥ 23 后存储权限改为运行时权限，应用没有 `requestPermissions` 调用（老代码），所以需要用户到系统设置里手动授予；授予后仍走 legacy 存储模型（targetSdk < 29，Android 10+ 不会强制 scoped storage），MediaStore 的 `DATA` 路径可直接 `fopen`，与原逻辑一致。
+
+## 6. m4a / 多格式支持：MediaCodec 回退解码器
+
+### 6.1 背景
+
+应用把 MediaStore 里 `is_music=1` 的所有音频都列出来（`.m4a`、`.aac`、`.flac`、`.ogg`、`.wav` 等），但原版 `libmpg.so` 只是 mpg123 的封装，**只能解 MP3**。用户播放 m4a 时 `openFile()` 返回 0，Java 层抛 `IllegalArgumentException`，`Playerv3.moveToNext()` 弹 "Не удалось открыть файл" 并把曲目从列表移除。
+
+### 6.2 设计：在 libmpg.so 内做回退，不动 Java
+
+`openFile()` 现在分两级：
+
+1. `open_mpg123()`：原路径，MP3 行为完全不变；
+2. 失败时 `media_decoder_open()`：用 NDK 的 `AMediaExtractor` + `AMediaCodec` 解码平台能解的任何音频格式，输出 **16-bit 立体声 PCM**（与应用的 Sonic/AudioTrack 管线要求一致：应用硬编码 2 声道），并通过同一套 JNI 方法提供 `readSamples/skipSamples/seekTo/seekToEnd/getRate/...`。
+
+关键实现点（`native/jni/media_decoder.c`）：
+
+- **用 fd 而不是路径**打开数据源：`open()` + `AMediaExtractor_setDataSourceFd(fd, 0, size)`。Android 新版本会把解封装交给独立服务进程，路径方式可能因跨进程权限失败；fd 方式由本进程打开，兼容性更好（实测路径方式在 Android 16 上返回 `AMEDIA_ERROR_UNSUPPORTED`，fd 方式成功）。
+- 解码器按 `pcm-encoding` 处理 16-bit / float32 / 8-bit 输出，统一转成 signed 16-bit；单声道复制成双声道，多声道取前两声道。
+- 输出采样率取 `INFO_OUTPUT_FORMAT_CHANGED` 后的真实值（例如 HE-AAC 的 SBR 会翻倍），因此在 `openFile()` 内先解码一小段完成"预热"，保证 `getRate()` 在 Java 侧创建 `AudioTrack`/`Sonic` 之前就是最终值。
+- `seekTo` = 帧数 → `AMediaExtractor_seekTo(timeUs, CLOSEST_SYNC)` + `AMediaCodec_flush()`；`seekToEnd(delta)` 按总帧数换算，越界返回 -1（与 `mpg123_seek(SEEK_END)` 的失败语义一致，应用会退回按时长估算）。
+- refill 循环有硬上限（约 2000 次 × 5 ms），任何解码器异常都不会让播放线程卡死。
+- 诊断日志写到应用自己的外部目录 `Android/data/com.neosphere.mafon/files/mafon_media.log`（失败时退回 `Download/mafon_media.log`），因为部分 ROM（如红魔/nubia）默认关闭 `adb logcat`。
+
+### 6.3 Android 15+ 的重要限制：NDK MediaCodec 需要进程里有 JVM
+
+在 Android 15/16 上，**NDK `AMediaCodec` 在纯 native 进程（无 JavaVM，例如 adb shell 里跑的测试二进制）中不会产出任何输出缓冲**（`dequeueOutputBuffer` 一直 `TRY_AGAIN`），这是 Android 15 引入的行为变化，FFmpeg 也把此类问题归为 "MediaCodec ceased working in new Android for JVM cause"（[ffmpeg #11363](https://trac.ffmpeg.org/ticket/11363)、[mozilla bug 1987001](https://bugzilla.mozilla.org/show_bug.cgi?id=1987001)）。
+
+本项目的测试也复现了同一现象：同一个 `media_decoder.c` 在 `adb shell` 里跑（`native/jni/media_test.c`）会卡住；装进 **有 JVM 的应用进程**（即 Mafon 本体）后解码正常。因此：
+
+- 运行时验证必须在应用进程内做（本项目通过 `libmpg.so` 的日志文件确认了完整解码：格式协商、整轨 pts 连续、EOS）；
+- `media_test.c` 只适合在 Android 14 及以下、或有 JVM 的环境（包成 app）使用，不要在 Android 15+ 的 shell 里用它判断功能是否正常。
+
+### 6.4 已知限制
+
+- 依赖系统解码器：设备缺某个格式的解码器时无法播放（行为与原来一致，跳过曲目）。
+- 单声道/多声道会被统一上混/裁剪为立体声（应用管线只有立体声）。
+- 解码器输出的最终采样率以 `INFO_OUTPUT_FORMAT_CHANGED` 为准；极少数流如果在第一次输出前就报错，`getRate()` 退回容器声明的采样率。
+- 反向播放（ffd/rwd）走 `seekToEnd`，对 m4a 会在同步帧粒度上近似（应用本身对非 MP3 也只做近似处理）。

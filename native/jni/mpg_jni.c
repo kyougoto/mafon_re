@@ -37,7 +37,10 @@
 
 #include <mpg123.h>
 
+#include "media_decoder.h"
+
 typedef struct mafon_decoder {
+    int mode; /* 0 = mpg123 (MP3), 1 = Android MediaCodec fallback */
     mpg123_handle *handle;
     int channels;
     int rate;
@@ -46,6 +49,7 @@ typedef struct mafon_decoder {
     unsigned char *buffer;
     int samples_available; /* in 16-bit samples */
     int buffer_pos;        /* in 16-bit samples */
+    media_decoder *media;  /* mode 1 only */
 } mafon_decoder;
 
 static mafon_decoder *as_decoder(jlong handle)
@@ -176,43 +180,48 @@ Java_nobleworks_libmpg_MP3Decoder_00024Feature_isFeatureSupported(JNIEnv *env, j
     return (jboolean)(mpg123_feature((int)feature) ? JNI_TRUE : JNI_FALSE);
 }
 
-JNIEXPORT jlong JNICALL
-Java_nobleworks_libmpg_MP3Decoder_openFile(JNIEnv *env, jobject thiz, jstring filename)
+/*
+ * Original MP3 path: open the file with mpg123 and force signed 16-bit PCM
+ * output at the stream's native rate/channels.  Returns NULL when mpg123
+ * cannot decode the file (e.g. m4a/AAC, flac, ogg, ...).
+ */
+static mafon_decoder *open_mpg123(JNIEnv *env, jstring filename)
 {
     mafon_decoder *decoder;
     mpg123_handle *handle;
     const char *path;
     int error = MPG123_OK;
     int encoding = 0;
+    long rate = 0;
     off_t length;
-
-    (void)thiz;
 
     handle = mpg123_new(NULL, &error);
     if (handle == NULL || error != MPG123_OK)
-        return 0;
+        return NULL;
 
     decoder = (mafon_decoder *)calloc(1, sizeof(*decoder));
     if (decoder == NULL) {
         mpg123_delete(handle);
-        return 0;
+        return NULL;
     }
+    decoder->mode = 0;
     decoder->handle = handle;
 
     path = (*env)->GetStringUTFChars(env, filename, NULL);
     if (path == NULL) {
         mpg123_delete(handle);
         free(decoder);
-        return 0;
+        return NULL;
     }
     error = mpg123_open(handle, path);
     (*env)->ReleaseStringUTFChars(env, filename, path);
     if (error != MPG123_OK)
         goto fail;
 
-    error = mpg123_getformat(handle, &decoder->rate, &decoder->channels, &encoding);
+    error = mpg123_getformat(handle, &rate, &decoder->channels, &encoding);
     if (error != MPG123_OK || encoding != MPG123_ENC_SIGNED_16)
         goto fail;
+    decoder->rate = (int)rate;
 
     /* Decode everything to signed 16-bit PCM, no resampling. */
     mpg123_format_none(handle);
@@ -233,15 +242,54 @@ Java_nobleworks_libmpg_MP3Decoder_openFile(JNIEnv *env, jobject thiz, jstring fi
     else
         decoder->length = (float)((double)length / (double)decoder->rate);
 
-    return (jlong)(intptr_t)decoder;
+    return decoder;
 
 fail:
     mpg123_close(handle);
     mpg123_delete(handle);
-    decoder->handle = NULL;
     free(decoder->buffer);
     free(decoder);
-    return 0;
+    return NULL;
+}
+
+/*
+ * Open a file: try mpg123 first (MP3, the original behaviour), then fall back
+ * to the platform decoder (MediaExtractor + MediaCodec) which handles m4a/AAC,
+ * flac, ogg/vorbis, opus, wav, ...  Returns 0 if neither can decode it, which
+ * the Java layer reports as "couldn't open file".
+ */
+JNIEXPORT jlong JNICALL
+Java_nobleworks_libmpg_MP3Decoder_openFile(JNIEnv *env, jobject thiz, jstring filename)
+{
+    mafon_decoder *decoder;
+    media_decoder *media;
+    const char *path;
+
+    (void)thiz;
+
+    decoder = open_mpg123(env, filename);
+    if (decoder != NULL)
+        return (jlong)(intptr_t)decoder;
+
+    path = (*env)->GetStringUTFChars(env, filename, NULL);
+    if (path == NULL)
+        return 0;
+    media = media_decoder_open(path);
+    (*env)->ReleaseStringUTFChars(env, filename, path);
+    if (media == NULL)
+        return 0;
+
+    decoder = (mafon_decoder *)calloc(1, sizeof(*decoder));
+    if (decoder == NULL) {
+        media_decoder_close(media);
+        return 0;
+    }
+    decoder->mode = 1;
+    decoder->media = media;
+    decoder->rate = media_decoder_rate(media);
+    decoder->channels = media_decoder_channels(media);
+    decoder->length = media_decoder_length(media);
+    return (jlong)(intptr_t)decoder;
 }
 
 JNIEXPORT void JNICALL
@@ -254,13 +302,17 @@ Java_nobleworks_libmpg_MP3Decoder_delete(JNIEnv *env, jobject thiz, jlong handle
     if (decoder == NULL)
         return;
 
-    mpg123_close(decoder->handle);
-    mpg123_delete(decoder->handle);
-    free(decoder->buffer);
+    if (decoder->mode == 1) {
+        media_decoder_close(decoder->media);
+    } else {
+        mpg123_close(decoder->handle);
+        mpg123_delete(decoder->handle);
+        free(decoder->buffer);
+    }
     free(decoder);
 }
 
-static int refill(mafon_decoder *decoder)
+static int refill_mpg(mafon_decoder *decoder)
 {
     size_t done = 0;
     int result = mpg123_read(decoder->handle, decoder->buffer, decoder->outblock, &done);
@@ -293,11 +345,14 @@ Java_nobleworks_libmpg_MP3Decoder_readSamples(JNIEnv *env, jobject thiz, jlong h
     if (dst == NULL)
         return 0;
 
+    if (decoder->mode == 1)
+        return (jint)media_decoder_read(decoder->media, dst, (int)count);
+
     while (copied < count) {
         int chunk;
 
         if (decoder->samples_available <= 0) {
-            if (!refill(decoder))
+            if (!refill_mpg(decoder))
                 return 0; /* faithful to the original: EOF/error => 0 */
         }
 
@@ -330,11 +385,14 @@ Java_nobleworks_libmpg_MP3Decoder_skipSamples(JNIEnv *env, jobject thiz, jlong h
     if (decoder == NULL || count <= 0)
         return 0;
 
+    if (decoder->mode == 1)
+        return (jint)media_decoder_skip(decoder->media, (int)count);
+
     while (skipped < count) {
         int chunk;
 
         if (decoder->samples_available <= 0) {
-            if (!refill(decoder))
+            if (!refill_mpg(decoder))
                 return 0;
         }
 
@@ -360,6 +418,9 @@ Java_nobleworks_libmpg_MP3Decoder_seekTo(JNIEnv *env, jobject thiz, jlong handle
     if (decoder == NULL)
         return -1;
 
+    if (decoder->mode == 1)
+        return (jint)media_decoder_seek(decoder->media, (int)sample);
+
     /* A seek invalidates samples that were already buffered. */
     decoder->samples_available = 0;
     decoder->buffer_pos = 0;
@@ -376,6 +437,9 @@ Java_nobleworks_libmpg_MP3Decoder_seekToEnd(JNIEnv *env, jobject thiz, jlong han
     if (decoder == NULL)
         return -1;
 
+    if (decoder->mode == 1)
+        return (jint)media_decoder_seek_end(decoder->media, (int)sample);
+
     decoder->samples_available = 0;
     decoder->buffer_pos = 0;
     return (jint)mpg123_seek(decoder->handle, (off_t)sample, SEEK_END);
@@ -388,7 +452,11 @@ Java_nobleworks_libmpg_MP3Decoder_getNumChannels(JNIEnv *env, jobject thiz, jlon
 
     (void)env;
     (void)thiz;
-    return decoder != NULL ? (jint)decoder->channels : 0;
+    if (decoder == NULL)
+        return 0;
+    if (decoder->mode == 1)
+        return (jint)media_decoder_channels(decoder->media);
+    return (jint)decoder->channels;
 }
 
 JNIEXPORT jint JNICALL
@@ -398,7 +466,11 @@ Java_nobleworks_libmpg_MP3Decoder_getRate(JNIEnv *env, jobject thiz, jlong handl
 
     (void)env;
     (void)thiz;
-    return decoder != NULL ? (jint)decoder->rate : 0;
+    if (decoder == NULL)
+        return 0;
+    if (decoder->mode == 1)
+        return (jint)media_decoder_rate(decoder->media);
+    return (jint)decoder->rate;
 }
 
 JNIEXPORT jfloat JNICALL
@@ -408,5 +480,9 @@ Java_nobleworks_libmpg_MP3Decoder_getLength(JNIEnv *env, jobject thiz, jlong han
 
     (void)env;
     (void)thiz;
-    return decoder != NULL ? (jfloat)decoder->length : 0.0f;
+    if (decoder == NULL)
+        return 0.0f;
+    if (decoder->mode == 1)
+        return (jfloat)media_decoder_length(decoder->media);
+    return (jfloat)decoder->length;
 }

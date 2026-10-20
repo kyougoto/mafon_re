@@ -226,11 +226,17 @@ if(MAFON_BUILD_MPG)
     "${_mafon_root}/jni"
     "${MPG123_SRC}/src/include")
 
+  # Android MediaExtractor/MediaCodec fallback decoder: makes m4a/AAC, flac,
+  # ogg/vorbis, opus, wav, ... playable through the same MP3Decoder JNI API.
+  if(_mpg_jni_real)
+    target_sources(mpg PRIVATE "${_mafon_root}/jni/media_decoder.c")
+  endif()
+
   if(TARGET mpg123static)
     target_link_libraries(mpg PRIVATE mpg123static)
   endif()
   if(ANDROID)
-    target_link_libraries(mpg PRIVATE log m)
+    target_link_libraries(mpg PRIVATE log m mediandk)
   endif()
   mafon_android_link_options(mpg)
 

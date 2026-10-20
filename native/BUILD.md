@@ -433,6 +433,14 @@ Notes:
   absent the `libmpg.so` target falls back to a placeholder that is never
   staged; `-BuildMpg` builds the placeholder explicitly.
 
+## 10.1 libmpg.so now also links libmediandk
+
+`libmpg.so` contains a fallback decoder (`jni/media_decoder.c`) that uses the NDK media APIs
+(`AMediaExtractor`/`AMediaCodec`) for non-MP3 formats (m4a/AAC, flac, ogg, opus, wav, ...).  It
+therefore links `libmediandk` (available since API 21) in addition to `liblog`/`libm`.  The CMake
+target already adds `-lmediandk`; nothing extra is needed for a normal build.  See
+`docs/ANALYSIS.md` section 6 for the design and the Android 15+ "MediaCodec needs a JavaVM" caveat.
+
 ## 11. Caveats
 
 1. **Unstripped artifacts.** NDK clang keeps `-g` even in Release, so

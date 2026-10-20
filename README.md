@@ -1,6 +1,6 @@
 # mafon_re — 让 «Мафон» / Mafon 在 arm64 设备上运行
 
-把只带 32 位 ARM 原生库的 Android 应用 **Mafon**（`com.neosphere.mafon`，versionName `1.0`，versionCode `75`，minSdk 8，targetSdk 16）改造为 **arm64-v8a (64 位)** 可用的 APK。
+把只带 32 位 ARM 原生库的 Android 应用 **Mafon**（`com.neosphere.mafon`，versionName `1.0`，versionCode `75`，minSdk 8，targetSdk 16）改造为 **arm64-v8a (64 位)** 可用的 APK，并补齐 **m4a/AAC、FLAC、OGG、Opus、WAV 等格式的播放**（原版只能播 MP3，但列表会把所有音频都列出来）。
 
 > 应用本体：俄罗斯开发者 neosphere 的卡带机模拟播放器（Электроника-302-2 皮肤 + Sonic 变速 + mpg123 解码）。
 > 本仓库不包含应用源码，只包含：重新编译的 64 位原生库、逆向得到的 JNI 封装源码、可复现的构建脚本、重打包说明以及可安装的成品 APK。
@@ -31,6 +31,19 @@ lib/armeabi-v7a/libmpg.so    lib/armeabi-v7a/libsonic.so
 2. **最小化改动 APK**：只在 zip 中新增 `lib/arm64-v8a/`，原有 `AndroidManifest.xml`、`classes.dex`、`resources.arsc`、`res/`、`assets/` 与 32 位库全部逐字节保留（32 位设备行为不变）。
 3. **重新签名**：`zipalign` + `apksigner`（v1 + v2 + v3），密钥随仓库公开（非机密测试密钥），保证后续用同一密钥重签可覆盖升级。
 
+## 支持的音频格式
+
+| 格式 | 解码方式 |
+| --- | --- |
+| `.mp3` | mpg123（原版路径，保持原有行为） |
+| `.m4a` / `.aac` / `.flac` / `.ogg` / `.opus` / `.wav` … | 系统 `MediaExtractor` + `MediaCodec`（NDK `libmediandk`）回退解码 |
+
+实现方式：`libmpg.so` 先按原样尝试用 mpg123 打开（MP3 走原路径）；失败时改用平台解码器把音频解码成 **16-bit 立体声 PCM**，再交给应用原有的 Sonic/AudioTrack 管线。这样 **Java 层、dex、清单都不需要改**，仍然保持"只新增原生库"的最小改动。
+
+> 只有系统自带解码器支持的格式才能播放（绝大多数手机都带 AAC/FLAC/Vorbis/Opus 解码器）。若设备不支持某格式，行为与原来一致：弹提示并跳过该曲目。
+
+已在红魔 10 Pro+（Android 16 / arm64-only）上实测：m4a 可被扫描并正常播放（验证记录见 [docs/VERIFICATION.md](docs/VERIFICATION.md)，其中涉及的文件名已脱敏）。
+
 ## 成品 APK
 
 | 文件 | 说明 | 适用系统 |
@@ -38,7 +51,7 @@ lib/armeabi-v7a/libmpg.so    lib/armeabi-v7a/libsonic.so
 | [`dist/mafon-1.0-arm64.apk`](dist/mafon-1.0-arm64.apk) | 只新增 arm64 库，**不改任何清单/行为** | Android 13 及以下；任何不再限制 targetSdk 的系统 |
 | [`dist/mafon-1.0-arm64-sdk25.apk`](dist/mafon-1.0-arm64-sdk25.apk) | 同上，另外把 `android:targetSdkVersion` 由 16 提升到 25 | Android 14/15（Android 14 起禁止安装 targetSdk < 23 的应用，Android 15 起 < 24） |
 
-也可以直接从 [GitHub Releases](https://github.com/kyougoto/mafon_re/releases/tag/v1.0-arm64) 下载这两个 APK。
+也可以直接从 [GitHub Releases](https://github.com/kyougoto/mafon_re/releases/tag/v1.1-arm64) 下载这两个 APK。
 
 安装：
 
@@ -67,7 +80,10 @@ mafon_re/
 ├── native/                       NDK/CMake 工程（构建 libmpg.so / libsonic.so）
 │   ├── CMakeLists.txt
 │   ├── build.ps1 / build.cmd
-│   └── jni/mpg_jni.c             ← 逆向重建的 MP3Decoder JNI 封装（本项目的核心代码）
+│   └── jni/
+│       ├── mpg_jni.c             ← 逆向重建的 MP3Decoder JNI 封装
+│       ├── media_decoder.c/.h    ← m4a 等格式的系统 MediaCodec 回退解码器
+│       └── media_test.c          ← 设备上的解码冒烟测试小程序
 ├── src/
 │   ├── mpg123/                   mpg123 1.32.10 原始源码（LGPL-2.1）
 │   └── sonic/                    waywardgeek/sonic-ndk 原始源码（LGPL-2.1）
@@ -107,7 +123,7 @@ python ..\tools\patch_apk.py --src <原版.apk> --libs ..\native\out\arm64-v8a `
 - `llvm-readelf`：两个 `.so` 均为 `ELF64 / AArch64 / DYN`，`SONAME` 正确，仅依赖 `liblog/libm/libdl/libc`（不再需要 `libstdc++`），`LOAD` 段按 16 KB 页对齐。
 - `llvm-nm -D`：`libmpg.so` 导出 14 个 `Java_nobleworks_libmpg_MP3Decoder_*`，`libsonic.so` 导出 20 个 `Java_org_vinuxproject_sonic_Sonic_*`，与原库符号集合一致。
 - `apksigner verify --print-certs`：v1/v2/v3 签名均通过；`zipalign -c -p 4` 通过；`aapt2 dump badging` 可正确解析包名/版本/targetSdk。
-- 未在物理 arm64 设备上做端到端试听（构建机没有此类设备），如有需要可按 [docs/VERIFICATION.md](docs/VERIFICATION.md) 的步骤在手机上复验。
+- 已在真机 **红魔 10 Pro+（NX789J，Android 16，仅 arm64-v8a）** 上验证：`arm64-v8a` 库正常加载、m4a 文件可扫描并正常播放（机主实测确认）；详见 [docs/VERIFICATION.md](docs/VERIFICATION.md)。
 
 ## 第三方组件 / 许可
 
